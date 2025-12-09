@@ -210,8 +210,10 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
 
             # TODO: Filter-Mapping ggf. an deine echte Xentral-API-Doku anpassen
             if name_contains:
-                # Beispiel für JSON:API-Style Filter – je nach Xentral-Version evtl. anpassen
-                params["filter[name][contains]"] = name_contains
+                    # Laut Fehlermeldung erwartet Xentral key/op/value
+                params["filter[name][key]"] = "name"
+                params["filter[name][op]"] = "contains"
+                params["filter[name][value]"] = name_contains
 
             if sku_equals:
                 params["filter[sku]"] = sku_equals
