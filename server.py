@@ -216,7 +216,9 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
                 params["filter[name][value]"] = name_contains
 
             if sku_equals:
-                params["filter[sku]"] = sku_equals
+                params["filter[sku][key]"] = "sku"
+                params["filter[sku][op]"] = "eq"
+                params["filter[sku][value]"] = sku_equals
 
             resp = await client.get("products", params=params)
             # bei HTTP-Fehlern eine saubere Fehlermeldung zurückgeben
