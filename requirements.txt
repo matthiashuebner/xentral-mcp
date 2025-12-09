@@ -1,0 +1,30 @@
+# Xentral MCP Server Dependencies
+
+# Web framework and HTTP
+Flask==2.3.3
+flask-cors==4.0.0
+
+# Environment configuration
+python-dotenv==1.0.0
+
+# HTTP client
+httpx==0.24.1
+
+# Additional utilities
+Werkzeug==2.3.7
+
+# JSON and data handling (built-in to Python 3.8+)
+# json (built-in)
+# dataclasses (built-in to Python 3.7+)
+# typing (built-in to Python 3.5+)
+# pathlib (built-in to Python 3.4+)
+# re (built-in)
+# logging (built-in)
+# os (built-in)
+# sys (built-in)
+# datetime (built-in)
+
+# Development and testing dependencies (optional)
+# pytest==7.4.2
+# pytest-flask==1.2.0
+# requests==2.31.0
