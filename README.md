@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/matthiashuebner-xentral-mcp-badge.png)](https://mseep.ai/app/matthiashuebner-xentral-mcp)
+
 # Xentral MCP HTTP Server
 
 A Model Context Protocol (MCP) HTTP server for Xentral ERP integration, providing powerful tools for daily ERP workflows.
