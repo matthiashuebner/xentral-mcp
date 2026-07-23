@@ -298,9 +298,11 @@ class MCPProtocol:
         
         # Get the tool object
         tool = self.tools[tool_name]
-        
-        # Log the tool call
-        logger.info(f"MCP tool call: {tool_name} with arguments: {tool_arguments}")
+
+        # Log the tool call. Only argument keys are logged; values may contain
+        # secrets (passwords, tokens) or PII.
+        arg_keys = sorted(tool_arguments.keys()) if isinstance(tool_arguments, dict) else []
+        logger.info(f"MCP tool call: {tool_name} (argument keys: {arg_keys})")
         
         try:
             # Check if this is an implemented tool or skeleton tool

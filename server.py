@@ -10,9 +10,10 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 import mcp.types as types
 
-# Setup Logging
+# Setup Logging. Default to INFO; DEBUG can leak request bodies containing
+# secrets/PII, so it must be opted into explicitly via XENTRAL_LOG_LEVEL.
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=getattr(logging, os.environ.get("XENTRAL_LOG_LEVEL", "INFO").upper(), logging.INFO),
     format="[xentral-mcp] %(levelname)s: %(message)s",
     stream=sys.stderr,
 )
@@ -249,7 +250,9 @@ async def list_tools() -> list[types.Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextContent]:
     """Wird vom MCP-Client aufgerufen, wenn Claude ein Tool nutzt."""
-    logger.info(f"Tool called: {name} with args: {arguments}")
+    # Log argument keys only; values may contain secrets/PII.
+    arg_keys = sorted(arguments.keys()) if isinstance(arguments, dict) else []
+    logger.info(f"Tool called: {name} (argument keys: {arg_keys})")
 
     async with httpx.AsyncClient(
         base_url=XENTRAL_BASE_URL,

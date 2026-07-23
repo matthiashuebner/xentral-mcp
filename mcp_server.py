@@ -22,11 +22,11 @@ from datetime import datetime
 
 # Third-party imports
 from flask import Flask, request, jsonify, Response, g
-from flask_cors import CORS
 
 # Local imports
 from config import config
 from mcp_protocol import MCPProtocol, MCPTool, MCPToolParameter
+from security import check_bearer_token, redact, ApiUrlValidationError
 from xentral.openapi.loader import load_openapi_tools
 
 # Setup logging
@@ -202,38 +202,79 @@ def _infer_tool_description(tool_name: str) -> str:
 # FLASK APPLICATION SETUP
 # =============================================================================
 
+# Endpoints that do not require authentication. Everything else is gated.
+PUBLIC_PATHS = frozenset({'/health'})
+
+
 def create_app():
     """Create and configure Flask application."""
     app = Flask(__name__)
-    CORS(app)  # Enable CORS for MCP clients
-    
+    # NOTE: CORS is intentionally NOT enabled. This server is driven by a local
+    # MCP client or a server-side proxy; permissive cross-origin access would
+    # let any website the operator visits drive the API (see security review).
+    # If a specific browser origin must be supported, add a narrowly-scoped
+    # allow-list here paired with the auth token — never a wildcard.
+
+    # =============================================================================
+    # AUTHENTICATION GATE
+    # =============================================================================
+
+    @app.before_request
+    def authenticate():
+        """Require a valid bearer token on every non-public request."""
+        if request.method == 'OPTIONS':
+            return None
+        if request.path in PUBLIC_PATHS:
+            return None
+        if not config.is_auth_enabled():
+            # No token configured: only tolerated on loopback (enforced at
+            # startup by validate_exposure). Local, same-origin requests pass.
+            return None
+        if not check_bearer_token(request.headers.get('Authorization'), config.auth_token):
+            logger.warning(
+                "Rejected unauthenticated request: %s %s from %s",
+                request.method, request.path, request.remote_addr,
+            )
+            return jsonify({
+                "jsonrpc": "2.0",
+                "error": {"code": -32001, "message": "Unauthorized"},
+            }), 401
+        return None
+
     # =============================================================================
     # REQUEST LOGGING MIDDLEWARE
     # =============================================================================
-    
+
     @app.before_request
     def log_request():
-        """Log incoming MCP requests."""
+        """Log incoming MCP requests with secrets redacted."""
         if config.log_requests and (request.path == '/mcp' or request.path.startswith('/mcp/')):
             timestamp = datetime.now().isoformat()
-            
+
             logger.info(f"[{timestamp}] MCP Request: {request.method} {request.path}")
-            
-            if request.is_json and request.json:
-                request_data = request.json
-                logger.info(f"[{timestamp}] Request Data: {request_data}")
-                
-                if 'method' in request_data:
+
+            if request.is_json and request.get_json(silent=True):
+                request_data = request.get_json(silent=True)
+
+                if isinstance(request_data, dict) and 'method' in request_data:
                     mcp_method = request_data['method']
                     logger.info(f"[{timestamp}] MCP Method: {mcp_method}")
-                    
+
                     if mcp_method == 'tools/call' and 'params' in request_data:
-                        params = request_data['params']
+                        params = request_data['params'] or {}
                         tool_name = params.get('name', 'unknown')
+                        # Log argument keys only; values may contain secrets/PII.
                         tool_args = params.get('arguments', {})
-                        
                         logger.info(f"[{timestamp}] Tool Call: {tool_name}")
-                        logger.info(f"[{timestamp}] Tool Arguments: {tool_args}")
+                        if isinstance(tool_args, dict):
+                            logger.info(
+                                f"[{timestamp}] Tool Argument keys: "
+                                f"{sorted(tool_args.keys())}"
+                            )
+                elif logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"[{timestamp}] Request Data: {redact(request_data)}"
+                    )
     
     # =============================================================================
     # MCP HTTP ENDPOINTS
@@ -255,11 +296,10 @@ def create_app():
             # Process the MCP request
             request_data = request.get_data(as_text=True)
             response_json = mcp_protocol.handle_request(request_data)
-            
+
             return Response(
                 response_json,
                 mimetype='application/json',
-                headers={'Access-Control-Allow-Origin': '*'}
             )
         
         except Exception as e:
@@ -305,13 +345,12 @@ def create_app():
     
     @app.route('/info', methods=['GET'])
     def server_info():
-        """Server information endpoint."""
+        """Server information endpoint (authenticated)."""
         return jsonify({
             "server": mcp_protocol.get_server_info(),
             "config": {
-                "api_url": config.api_url,
-                "api_key": "***" if config.api_key else "not_configured",
-                "debug": config.debug_mode
+                "api_configured": bool(config.api_url and config.api_key),
+                "auth_enabled": config.is_auth_enabled(),
             }
         }), 200
     
@@ -339,33 +378,37 @@ def create_app():
     
     @app.route('/config/credentials', methods=['POST'])
     def update_credentials():
-        """Update API credentials at runtime."""
+        """Update API credentials at runtime (authenticated + validated)."""
         try:
-            data = request.get_json()
-            
+            data = request.get_json(silent=True)
+
             if not data:
                 return jsonify({"error": "Request body is required"}), 400
-            
+
             api_url = data.get('api_url')
             api_key = data.get('api_key')
-            
+
             if not api_url or not api_key:
                 return jsonify({"error": "Both api_url and api_key are required"}), 400
-            
-            # Update configuration
-            config.update_credentials(api_url, api_key)
-            
+
+            # Validates the URL against the SSRF/HTTPS/allow-list policy;
+            # rejects internal/metadata targets and plaintext transport.
+            try:
+                config.update_credentials(api_url, api_key)
+            except ApiUrlValidationError as exc:
+                logger.warning("Rejected credential update: %s", exc)
+                return jsonify({"error": f"Invalid api_url: {exc}"}), 400
+
             logger.info("✅ API credentials updated successfully")
-            
+
             return jsonify({
                 "status": "success",
                 "message": "API credentials updated",
-                "api_url": config.api_url
             }), 200
-        
+
         except Exception as e:
             logger.error(f"Error updating credentials: {e}")
-            return jsonify({"error": str(e)}), 500
+            return jsonify({"error": "Failed to update credentials"}), 500
     
     # =============================================================================
     # ERROR HANDLERS
@@ -429,18 +472,31 @@ def main():
     
     # Display configuration
     print(f"Server: {config.server_name} v{config.server_version}")
-    print(f"API URL: {config.api_url}")
     print(f"API Key: {'✓ Configured' if config.api_key else '✗ Not configured'}")
     print(f"Host: {config.server_host}")
     print(f"Port: {config.server_port}")
-    print(f"Debug: {config.debug_mode}")
+    print(f"Auth: {'✓ Token required' if config.is_auth_enabled() else '✗ DISABLED'}")
     print("-" * 60)
-    
+
+    # Fatal exposure checks: never bind to the network without authentication.
+    exposure_errors = config.validate_exposure()
+    if exposure_errors:
+        print("❌ Refusing to start due to insecure exposure:")
+        for error in exposure_errors:
+            print(f"   - {error}")
+        return 1
+
+    if not config.is_auth_enabled():
+        print("⚠️  WARNING: no MCP_AUTH_TOKEN set. The server is reachable without")
+        print("   authentication and is bound to loopback only. Set MCP_AUTH_TOKEN")
+        print("   before exposing it beyond this machine.")
+        print("-" * 60)
+
     # Validate configuration
     if not validate_configuration():
         print("\n💡 Update credentials via POST /config/credentials endpoint")
         print("-" * 60)
-    
+
     # Initialize tools
     if not initialize_tools():
         print("❌ Failed to initialize tools. Server will start but may not function properly.")
@@ -461,10 +517,12 @@ def main():
     print("=" * 60)
     
     try:
+        # debug is hard-disabled: the Werkzeug interactive debugger is an RCE
+        # vector and must never run on a reachable server.
         app.run(
             host=config.server_host,
             port=config.server_port,
-            debug=config.debug_mode,
+            debug=False,
             threaded=True
         )
     except KeyboardInterrupt:

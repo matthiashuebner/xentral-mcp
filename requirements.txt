@@ -2,7 +2,9 @@
 
 # Web framework and HTTP
 Flask>=3.0
-flask-cors>=4.0
+
+# Production WSGI server (do not use the Flask dev server for exposed deployments)
+gunicorn>=22.0
 
 # Environment configuration
 python-dotenv>=1.0

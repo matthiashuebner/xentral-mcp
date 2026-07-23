@@ -9,6 +9,7 @@ Usage:
     python mcp_client.py call search_customers --name "John" --city "Berlin"
 """
 
+import os
 import sys
 import argparse
 import json
@@ -18,17 +19,27 @@ from typing import Optional, Dict, Any
 
 class MCPClient:
     """Client for interacting with MCP server."""
-    
-    def __init__(self, server_url: str = "http://localhost:8888"):
+
+    def __init__(self, server_url: str = "http://localhost:8888",
+                 auth_token: Optional[str] = None):
         """
         Initialize MCP client.
-        
+
         Args:
             server_url: MCP server URL
+            auth_token: Bearer token (defaults to the MCP_AUTH_TOKEN env var)
         """
         self.server_url = server_url
         self.mcp_endpoint = f"{server_url}/mcp"
         self.tools_endpoint = f"{server_url}/tools"
+        self.auth_token = auth_token or os.getenv("MCP_AUTH_TOKEN", "")
+
+    def _headers(self) -> Dict[str, str]:
+        """Build request headers including auth when a token is configured."""
+        headers = {"Content-Type": "application/json"}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        return headers
     
     def initialize(self) -> bool:
         """Initialize MCP protocol."""
@@ -47,9 +58,9 @@ class MCPClient:
                 }
             }
             
-            response = requests.post(self.mcp_endpoint, json=payload)
+            response = requests.post(self.mcp_endpoint, json=payload, headers=self._headers())
             response.raise_for_status()
-            
+
             print("✅ MCP Server initialized")
             return True
         
@@ -60,7 +71,7 @@ class MCPClient:
     def list_tools(self) -> Optional[list]:
         """List all available tools."""
         try:
-            response = requests.get(self.tools_endpoint)
+            response = requests.get(self.tools_endpoint, headers=self._headers())
             response.raise_for_status()
             
             data = response.json()
@@ -92,11 +103,11 @@ class MCPClient:
                 }
             }
             
-            response = requests.post(self.mcp_endpoint, json=payload)
+            response = requests.post(self.mcp_endpoint, json=payload, headers=self._headers())
             response.raise_for_status()
-            
+
             data = response.json()
-            
+
             # Extract content from response
             if 'result' in data and data['result']:
                 content = data['result'].get('content', [])
@@ -153,6 +164,12 @@ Examples:
         default='http://localhost:8888',
         help='MCP server URL (default: http://localhost:8888)'
     )
+
+    parser.add_argument(
+        '--token',
+        default=None,
+        help='Bearer auth token (default: MCP_AUTH_TOKEN env var)'
+    )
     
     subparsers = parser.add_subparsers(dest='command', help='Command to execute')
     
@@ -171,7 +188,7 @@ Examples:
     args = parser.parse_args()
     
     # Create client
-    client = MCPClient(args.server)
+    client = MCPClient(args.server, auth_token=args.token)
     
     # Initialize
     if not client.initialize():
