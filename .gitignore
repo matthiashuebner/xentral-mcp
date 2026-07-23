@@ -1,0 +1,15 @@
+# Environment & secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime artifacts
+mcp_server.log
+downloads/
+
+# macOS
+.DS_Store

@@ -100,12 +100,6 @@ class SearchCustomers(XentralAPIBase):
             title="Customer Search Results",
             total_count=total
         )
-            output.append("")
-        
-        if len(items) > 10:
-            output.append(f"... and {len(items) - 10} more")
-        
-        return "\n".join(output)
     
     def _format_raw_response(self, api_data: Dict[str, Any]) -> str:
         """

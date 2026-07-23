@@ -27,6 +27,7 @@ from flask_cors import CORS
 # Local imports
 from config import config
 from mcp_protocol import MCPProtocol, MCPTool, MCPToolParameter
+from xentral.openapi.loader import load_openapi_tools
 
 # Setup logging
 def setup_logging():
@@ -140,7 +141,13 @@ def initialize_tools():
             
             all_tools.append(mcp_tool)
             logger.info(f"✅ Created MCP tool: {tool_name}")
-        
+
+        # Step 3: Load OpenAPI-generated tools for the full Xentral API.
+        # Hand-written tools take precedence on name collisions.
+        openapi_tools = load_openapi_tools(exclude_names=set(implemented_tools.keys()))
+        all_tools.extend(openapi_tools)
+        logger.info(f"✅ Loaded {len(openapi_tools)} OpenAPI-generated tools")
+
         if not all_tools:
             logger.warning("No implemented tools were found")
             return False

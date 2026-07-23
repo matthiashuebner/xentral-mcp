@@ -1,20 +1,17 @@
 # Xentral MCP Server Dependencies
 
 # Web framework and HTTP
-Flask==2.3.3
-flask-cors==4.0.0
+Flask>=3.0
+flask-cors>=4.0
 
 # Environment configuration
-python-dotenv==1.0.0
+python-dotenv>=1.0
 
 # HTTP client
-httpx==0.24.1
-
-# Additional utilities
-Werkzeug==2.3.7
+httpx>=0.27
 
 # Table formatting
-tabulate==0.9.0
+tabulate>=0.9
 
 # JSON and data handling (built-in to Python 3.8+)
 # json (built-in)

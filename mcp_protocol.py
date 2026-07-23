@@ -32,10 +32,17 @@ class MCPToolParameter:
 
 @dataclass
 class MCPTool:
-    """MCP tool definition."""
+    """
+    MCP tool definition.
+
+    Either provide flat `parameters` (legacy hand-written tools) or a full
+    JSON Schema via `input_schema` (OpenAPI-generated tools). When
+    `input_schema` is set it takes precedence over `parameters`.
+    """
     name: str
     description: str
     parameters: List[MCPToolParameter]
+    input_schema: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -228,7 +235,13 @@ class MCPProtocol:
                     "required": []
                 }
             }
-            
+
+            # OpenAPI-generated tools carry a complete JSON Schema
+            if tool.input_schema:
+                tool_schema["inputSchema"] = tool.input_schema
+                tools_list.append(tool_schema)
+                continue
+
             # Add parameters to schema
             for param in tool.parameters:
                 prop_def = {
