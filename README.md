@@ -9,7 +9,7 @@ exposes the **complete Xentral API** — every endpoint of the official
 
 ## 🚀 Features
 
-- **Full API coverage**: 339 auto-generated tools covering all documented
+- **Full API coverage**: 339 tools covering all documented
   Xentral API endpoints (customers, products, sales orders, invoices,
   warehousing, accounting, analytics, POS, production, …)
 - **Curated tools**: Hand-written convenience tools with table-formatted
