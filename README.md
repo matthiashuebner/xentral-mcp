@@ -34,7 +34,7 @@ exposes the **complete Xentral API** — every endpoint of the official
 ## 🛠️ Installation
 
 ```bash
-git clone https://github.com/yourusername/xentral-mcp.git
+git clone https://github.com/matthiashuebner/xentral-mcp.git
 cd xentral-mcp
 pip install -r requirements.txt
 cp .env.example .env
