@@ -21,8 +21,13 @@ exposes the **complete Xentral API** — every endpoint of the official
   to `downloads/` instead of flooding the context window
 - **Response truncation**: Large list responses are trimmed with a hint to
   use filters/pagination
+- **Authenticated by default**: Bearer-token auth on every endpoint; binds to
+  loopback only and refuses to expose itself to the network without a token
+- **SSRF-hardened**: API base URL is validated (HTTPS, host allow-list,
+  internal/metadata addresses blocked) before any request is sent
 - **Runtime Configuration**: Update API credentials dynamically without restart
-- **Comprehensive Logging**: All MCP requests, responses, and tool calls logged
+- **Redacted Logging**: Request method, tool name and argument *keys* are
+  logged — never secret values or PII
 
 ## 📋 Requirements
 
@@ -36,17 +41,51 @@ git clone https://github.com/yourusername/xentral-mcp.git
 cd xentral-mcp
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env: set XENTRAL_API_URL (instance base URL, no /api suffix)
-# and XENTRAL_API_KEY (personal access token)
+# Edit .env: set XENTRAL_API_URL (instance base URL, no /api suffix),
+# XENTRAL_API_KEY (personal access token), and MCP_AUTH_TOKEN
 ```
 
+Generate an auth token:
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+## 🔒 Security model
+
+- **Loopback by default.** `MCP_SERVER_HOST` defaults to `127.0.0.1`. The
+  server **refuses to start** on any other interface unless `MCP_AUTH_TOKEN`
+  is set — never expose it without a token.
+- **Token auth.** Every endpoint except `/health` requires
+  `Authorization: Bearer <MCP_AUTH_TOKEN>`. Without a token configured, access
+  is tolerated only on loopback (with a startup warning).
+- **No CORS.** Cross-origin access is disabled so a website cannot drive the
+  API from the operator's browser.
+- **SSRF guard.** `XENTRAL_API_URL` must be HTTPS (except localhost) and must
+  not resolve to a private/loopback/link-local/metadata address. Set
+  `XENTRAL_ALLOWED_HOSTS` to pin the allowed host(s).
+- **No debug server.** The Werkzeug interactive debugger is never enabled.
+
 ## 🏃 Running the Server
+
+Local development (loopback, dev server):
 
 ```bash
 python mcp_server.py
 ```
 
-The server starts on `http://0.0.0.0:8888` by default and registers 341 tools.
+Production — use a real WSGI server behind a TLS-terminating, authenticating
+reverse proxy. **Do not** expose the Flask development server directly:
+
+```bash
+gunicorn --bind 127.0.0.1:8888 wsgi:app
+```
+
+The server registers 341 tools. Authenticated calls carry the bearer token:
+
+```bash
+curl -H "Authorization: Bearer $MCP_AUTH_TOKEN" http://localhost:8888/info
+```
 
 ## 🔧 Tool Catalog (auto-generated API tools)
 
@@ -77,23 +116,24 @@ resource.
 
 ## 🔍 Testing
 
+All endpoints except `/health` require the bearer token when `MCP_AUTH_TOKEN`
+is set.
+
 ```bash
-# Health check
+# Health check (public)
 curl http://localhost:8888/health
 
 # List all tools
 curl -X POST http://localhost:8888/mcp \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
 # Call a tool: list customers named Miller
 curl -X POST http://localhost:8888/mcp \
+  -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"customer_list_v2","arguments":{"filter":[{"key":"name","op":"equals","value":"Miller"}],"page":{"number":"1","size":"10"}}}}'
-
-# CLI client
-python mcp_client.py list-tools
-python mcp_client.py call search_customers --name "Miller"
 ```
 
 ## 📁 Project Structure
