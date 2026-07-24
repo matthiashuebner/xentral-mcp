@@ -134,6 +134,61 @@ def _clamp_page_size(requested: int) -> int:
     return max(10, min(150, requested))
 
 
+# Cache für die Analytics-Tabellen-Dokumentation (~1 MB, ändert sich selten).
+# Wird einmal pro Serverprozess geladen.
+_analytics_docs_cache: Optional[list] = None
+
+
+async def _get_analytics_docs(client: httpx.AsyncClient) -> tuple[Optional[list], Any]:
+    """Lädt die Analytics-Tabellen-Doku (gecacht). Gibt (tables, error_data) zurück."""
+    global _analytics_docs_cache
+    if _analytics_docs_cache is not None:
+        return (_analytics_docs_cache, None)
+
+    status_code, data = await _make_request(client, "GET", "analytics/documentation")
+    if status_code >= 400 or not isinstance(data, dict):
+        return (None, data)
+
+    tables = data.get("data") or []
+    _analytics_docs_cache = tables
+    return (tables, None)
+
+
+def _format_analytics_tables(tables: list, search: Optional[str]) -> str:
+    """Formatiert die Tabellen-Doku kompakt; filtert optional per Suchbegriff."""
+    if not search:
+        lines = [f"{len(tables)} Analytics-Tabellen (Details per Suchbegriff):", ""]
+        for t in tables:
+            lines.append(f"- {t.get('label')}: {(t.get('shortDescription') or '').strip()}")
+        return "\n".join(lines)
+
+    needle = search.lower()
+    matches = []
+    for t in tables:
+        label = str(t.get("label") or "")
+        desc = str(t.get("shortDescription") or "")
+        columns = [str(c.get("name") or "") for c in (t.get("columns") or [])]
+        matching_cols = [c for c in columns if needle in c.lower()]
+        if needle in label.lower() or needle in desc.lower() or matching_cols:
+            matches.append((label, desc.strip(), columns, matching_cols))
+
+    if not matches:
+        return f"Keine Analytics-Tabelle passt zu '{search}'."
+
+    # Treffer im Tabellennamen zuerst, dann kompakt ausgeben (max. 15 Tabellen).
+    matches.sort(key=lambda m: (needle not in m[0].lower(), m[0]))
+    lines = [f"{len(matches)} Tabellen passen zu '{search}':", ""]
+    for label, desc, columns, matching_cols in matches[:15]:
+        lines.append(f"## {label}")
+        if desc:
+            lines.append(desc)
+        lines.append(f"Spalten ({len(columns)}): {', '.join(columns)}")
+        lines.append("")
+    if len(matches) > 15:
+        lines.append(f"... und {len(matches) - 15} weitere Tabellen (Suchbegriff verfeinern).")
+    return "\n".join(lines)
+
+
 def _truncate_data(data: Any, limit: int) -> Any:
     """Kürzt die 'data'-Liste einer Xentral-Antwort auf 'limit' Einträge."""
     if isinstance(data, dict) and isinstance(data.get("data"), list):
@@ -309,6 +364,59 @@ async def list_tools() -> list[types.Tool]:
                     }
                 },
                 "required": ["invoiceId"],
+            },
+        ),
+        types.Tool(
+            name="xentral_analytics_query",
+            description=(
+                "Führt eine SQL-Abfrage über die Xentral-Analytics-API aus "
+                "(Berichtswesen, AWS Redshift). Ideal für Auswertungen und "
+                "Aggregationen wie Umsatz pro Produkt/Kunde/Monat, statt viele "
+                "Einzelabrufe über die REST-API zu machen. "
+                "WICHTIG: Redshift-SQL-Dialekt (nicht MySQL). Jede Abfrage "
+                "kostet 1 Credit aus dem monatlichen Kontingent (Stand wird "
+                "mit zurückgegeben). Die Daten werden nur einmal pro Nacht "
+                "(0 Uhr UTC) aktualisiert – dieselbe Frage am selben Tag nicht "
+                "wiederholt abfragen. Tabellen/Spalten vorher mit "
+                "xentral_analytics_tables nachschlagen. Wichtige Tabellen: "
+                "invoices, invoice_items, sales_orders, sales_order_items, "
+                "products, credit_notes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": (
+                            "SQL-Abfrage (Redshift-Dialekt), z.B. "
+                            "SELECT product_number, SUM(net_revenue_item_total) "
+                            "FROM invoice_items GROUP BY 1 ORDER BY 2 DESC LIMIT 10"
+                        ),
+                    },
+                },
+                "required": ["sql"],
+            },
+        ),
+        types.Tool(
+            name="xentral_analytics_tables",
+            description=(
+                "Durchsucht die Dokumentation der Xentral-Analytics-Tabellen "
+                "(Datenmodell für xentral_analytics_query). Ohne Suchbegriff: "
+                "Liste aller Tabellen mit Kurzbeschreibung. Mit Suchbegriff: "
+                "passende Tabellen inkl. aller Spaltennamen. Kostet keine Credits."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "search": {
+                        "type": "string",
+                        "description": (
+                            "Optional: Suchbegriff (case-insensitive), matcht auf "
+                            "Tabellennamen, Beschreibung und Spaltennamen, "
+                            "z.B. 'invoice' oder 'revenue'."
+                        ),
+                    },
+                },
             },
         ),
         types.Tool(
@@ -576,6 +684,57 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
                 ]
 
             text = json.dumps(data, indent=2, ensure_ascii=False)
+            return [types.TextContent(type="text", text=text)]
+
+        # ---------------------------------------------------------------
+        #   Analytics: SQL-Abfrage (Berichtswesen)
+        # ---------------------------------------------------------------
+        if name == "xentral_analytics_query":
+            sql = str(arguments.get("sql") or "").strip()
+            if not sql:
+                return [types.TextContent(type="text", text="sql darf nicht leer sein")]
+
+            status_code, data = await _make_request(
+                client, "POST", "analytics/query", json_body={"query": sql}
+            )
+
+            if status_code >= 400:
+                return [
+                    types.TextContent(
+                        type="text",
+                        text=f"HTTP-Fehler {status_code} von Xentral bei xentral_analytics_query: {data}",
+                    )
+                ]
+
+            text = json.dumps(data, indent=2, ensure_ascii=False)
+
+            # Credit-Stand anhängen, damit der Verbrauch sichtbar bleibt.
+            credit_status, credit_data = await _make_request(client, "GET", "analytics/credit")
+            if credit_status < 400 and isinstance(credit_data, dict):
+                entries = credit_data.get("data") or []
+                if entries:
+                    used = entries[0].get("usedCredits")
+                    total = entries[0].get("totalCredits")
+                    text += f"\n\nAnalytics-Credits: {used}/{total} verbraucht (monatliches Kontingent)."
+
+            return [types.TextContent(type="text", text=text)]
+
+        # ---------------------------------------------------------------
+        #   Analytics: Tabellen-Dokumentation durchsuchen
+        # ---------------------------------------------------------------
+        if name == "xentral_analytics_tables":
+            search = arguments.get("search")
+
+            tables, error_data = await _get_analytics_docs(client)
+            if tables is None:
+                return [
+                    types.TextContent(
+                        type="text",
+                        text=f"Analytics-Dokumentation konnte nicht geladen werden: {error_data}",
+                    )
+                ]
+
+            text = _format_analytics_tables(tables, search)
             return [types.TextContent(type="text", text=text)]
 
         # ---------------------------------------------------------------
