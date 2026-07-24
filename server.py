@@ -53,9 +53,12 @@ def _auth_headers() -> Dict[str, str]:
 
 # Einige Xentral-Endpunkte (z.B. GET /invoices) beantworten
 # 'Accept: application/json' mit HTTP 406 und verlangen einen
-# versionierten Vendor-Media-Type. Bei 406 werden diese Accept-Werte
-# der Reihe nach durchprobiert.
+# Vendor-Media-Type. Bei 406 werden diese Accept-Werte der Reihe
+# nach durchprobiert. Empirisch (Instanz 643920e461b65) funktioniert
+# für /invoices nur 'application/vnd.xentral.minimal+json'; die
+# 'default'-Varianten liefern dort immer 406.
 ACCEPT_FALLBACKS = [
+    "application/vnd.xentral.minimal+json",
     "application/vnd.xentral.default.v1+json",
     "application/vnd.xentral.default.v1-beta+json",
     "*/*",
