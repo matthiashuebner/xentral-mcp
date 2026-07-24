@@ -227,9 +227,9 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "pageSize": {
                         "type": "integer",
-                        "description": "Anzahl Produkte pro Seite (wird auf page[size] gemappt).",
+                        "description": "Anzahl Produkte pro Seite (Standard 20).",
                         "minimum": 1,
-                        "maximum": 200,
+                        "maximum": 150,
                     },
                     "nameContains": {
                         "type": "string",
@@ -259,23 +259,27 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="xentral_list_customers",
             description=(
-                "Listet Kunden aus Xentral. "
-                "Verwende pageNumber und pageSize für Pagination. "
+                "Listet Kunden aus Xentral. Der Endpunkt nutzt Cursor-Pagination: "
+                "Die Antwort enthält extra.totalCount (Gesamtzahl) und "
+                "extra.cursor.nextCursor – diesen Wert als 'cursor' übergeben, "
+                "um die nächste Seite zu laden. "
                 "Optional kann nach Name oder E-Mail gefiltert werden."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "pageNumber": {
+                    "limit": {
                         "type": "integer",
-                        "description": "Seitenzahl ab 1 (wird auf page[number] gemappt).",
+                        "description": "Anzahl Kunden pro Seite (Standard 20).",
                         "minimum": 1,
+                        "maximum": 50,
                     },
-                    "pageSize": {
-                        "type": "integer",
-                        "description": "Anzahl Kunden pro Seite (wird auf page[size] gemappt).",
-                        "minimum": 1,
-                        "maximum": 200,
+                    "cursor": {
+                        "type": "string",
+                        "description": (
+                            "Optional: nextCursor-Wert aus der vorherigen Antwort "
+                            "(extra.cursor.nextCursor) für die nächste Seite."
+                        ),
                     },
                     "nameContains": {
                         "type": "string",
@@ -492,27 +496,28 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
             # Validierung
             if page_number < 1:
                 return [types.TextContent(type="text", text="pageNumber muss >= 1 sein")]
-            if page_size < 1 or page_size > 200:
-                return [types.TextContent(type="text", text="pageSize muss zwischen 1 und 200 liegen")]
+            if page_size < 1 or page_size > 150:
+                return [types.TextContent(type="text", text="pageSize muss zwischen 1 und 150 liegen")]
 
             params: Dict[str, Any] = {
-                "page[number]": page_number,
-                "page[size]": page_size,
+                "page[number]": str(page_number),
+                # Xentral verlangt page[size] zwischen 10 und 150; bei
+                # kleinerem pageSize wird die Antwort unten gekürzt.
+                "page[size]": str(_clamp_page_size(page_size)),
             }
 
-            # TODO: Filter-Mapping an echte Xentral-API-Doku anpassen
+            filters = []
             if name_contains:
-                params["filter[name][key]"] = "name"
-                params["filter[name][op]"] = "contains"
-                params["filter[name][value]"] = name_contains
-
+                filters.append(("name", "contains", name_contains))
             if sku_equals:
-                params["filter[sku][key]"] = "sku"
-                params["filter[sku][op]"] = "eq"
-                params["filter[sku][value]"] = sku_equals
+                filters.append(("number", "equals", sku_equals))
+            for i, (key, op, value) in enumerate(filters):
+                params[f"filter[{i}][key]"] = key
+                params[f"filter[{i}][op]"] = op
+                params[f"filter[{i}][value]"] = value
 
             status_code, data = await _make_request(client, "GET", "products", params=params)
-            
+
             if status_code >= 400:
                 return [
                     types.TextContent(
@@ -521,6 +526,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
                     )
                 ]
 
+            data = _truncate_data(data, page_size)
             text = json.dumps(data, indent=2, ensure_ascii=False)
             return [types.TextContent(type="text", text=text)]
 
@@ -550,35 +556,36 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         #   Kunden: Liste
         # ---------------------------------------------------------------
         if name == "xentral_list_customers":
-            page_number = int(arguments.get("pageNumber", 1))
-            page_size = int(arguments.get("pageSize", 20))
+            limit = int(arguments.get("limit", 20))
+            cursor = arguments.get("cursor")
             name_contains = arguments.get("nameContains")
             email_contains = arguments.get("emailContains")
 
-            # Validierung
-            if page_number < 1:
-                return [types.TextContent(type="text", text="pageNumber muss >= 1 sein")]
-            if page_size < 1 or page_size > 200:
-                return [types.TextContent(type="text", text="pageSize muss zwischen 1 und 200 liegen")]
+            if limit < 1 or limit > 50:
+                return [types.TextContent(type="text", text="limit muss zwischen 1 und 50 liegen")]
 
+            # Der customers-Endpunkt nutzt Cursor-Pagination; page[number]/
+            # page[size] lehnt er mit einem Validierungsfehler ab.
+            # cursor[size] muss zwischen 10 und 50 liegen; bei kleinerem
+            # limit wird die Antwort unten gekürzt.
             params: Dict[str, Any] = {
-                "page[number]": page_number,
-                "page[size]": page_size,
+                "cursor[size]": str(max(10, min(50, limit))),
             }
+            if cursor:
+                params["cursor[nextCursor]"] = str(cursor)
 
-            # TODO: Filter-Mapping an Xentral-Doku anpassen
+            filters = []
             if name_contains:
-                params["filter[name][key]"] = "name"
-                params["filter[name][op]"] = "contains"
-                params["filter[name][value]"] = name_contains
-
+                filters.append(("name", "contains", name_contains))
             if email_contains:
-                params["filter[email][key]"] = "email"
-                params["filter[email][op]"] = "contains"
-                params["filter[email][value]"] = email_contains
+                filters.append(("email", "contains", email_contains))
+            for i, (key, op, value) in enumerate(filters):
+                params[f"filter[{i}][key]"] = key
+                params[f"filter[{i}][op]"] = op
+                params[f"filter[{i}][value]"] = value
 
             status_code, data = await _make_request(client, "GET", "customers", params=params)
-            
+
             if status_code >= 400:
                 return [
                     types.TextContent(
@@ -587,6 +594,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
                     )
                 ]
 
+            data = _truncate_data(data, limit)
             text = json.dumps(data, indent=2, ensure_ascii=False)
             return [types.TextContent(type="text", text=text)]
 
