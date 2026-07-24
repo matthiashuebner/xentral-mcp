@@ -51,6 +51,17 @@ def _auth_headers() -> Dict[str, str]:
     }
 
 
+# Einige Xentral-Endpunkte (z.B. GET /invoices) beantworten
+# 'Accept: application/json' mit HTTP 406 und verlangen einen
+# versionierten Vendor-Media-Type. Bei 406 werden diese Accept-Werte
+# der Reihe nach durchprobiert.
+ACCEPT_FALLBACKS = [
+    "application/vnd.xentral.default.v1+json",
+    "application/vnd.xentral.default.v1-beta+json",
+    "*/*",
+]
+
+
 async def _make_request(
     client: httpx.AsyncClient,
     method: str,
@@ -58,6 +69,7 @@ async def _make_request(
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
     retries: int = 0,
+    headers: Optional[Dict[str, str]] = None,
 ) -> tuple[int, Any]:
     """
     Macht einen HTTP-Request zu Xentral mit Retry-Logik.
@@ -67,7 +79,7 @@ async def _make_request(
         raise RuntimeError(
             f"Max retries ({XENTRAL_MAX_RETRIES}) exceeded for {method} {path}"
         )
-    
+
     try:
         logger.debug(f"{method} {path} (attempt {retries + 1})")
         resp = await client.request(
@@ -75,31 +87,55 @@ async def _make_request(
             url=path,
             params=params,
             json=json_body,
+            headers=headers,
         )
-        
+
         # Versuchen, JSON zu lesen – sonst Text
         try:
             data = resp.json()
         except ValueError:
             data = resp.text
-        
+
+        if resp.status_code == 406 and headers is None:
+            for accept in ACCEPT_FALLBACKS:
+                status_code, data = await _make_request(
+                    client, method, path, params, json_body,
+                    retries=retries, headers={"Accept": accept},
+                )
+                if status_code != 406:
+                    logger.info(f"Accept-Fallback '{accept}' erfolgreich für {method} {path}")
+                    return (status_code, data)
+            return (406, data)
+
         if resp.is_error:
             logger.warning(
                 f"HTTP {resp.status_code} from Xentral {method} {path}: {data}"
             )
         else:
             logger.debug(f"Success: HTTP {resp.status_code}")
-        
+
         return (resp.status_code, data)
-        
+
     except httpx.TimeoutException:
         logger.warning(f"Timeout for {method} {path}, retrying...")
         await asyncio.sleep(2 ** retries)  # Exponential backoff
-        return await _make_request(client, method, path, params, json_body, retries + 1)
+        return await _make_request(client, method, path, params, json_body, retries + 1, headers)
     except httpx.RequestError as exc:
         logger.warning(f"Request error for {method} {path}: {exc}, retrying...")
         await asyncio.sleep(2 ** retries)
-        return await _make_request(client, method, path, params, json_body, retries + 1)
+        return await _make_request(client, method, path, params, json_body, retries + 1, headers)
+
+
+def _clamp_page_size(requested: int) -> int:
+    """Xentral verlangt page[size] zwischen 10 und 150."""
+    return max(10, min(150, requested))
+
+
+def _truncate_data(data: Any, limit: int) -> Any:
+    """Kürzt die 'data'-Liste einer Xentral-Antwort auf 'limit' Einträge."""
+    if isinstance(data, dict) and isinstance(data.get("data"), list):
+        data = {**data, "data": data["data"][:limit]}
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -209,11 +245,77 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="xentral_list_invoices",
+            description=(
+                "Listet Rechnungen (Verkaufsrechnungen) aus Xentral, "
+                "standardmäßig neueste zuerst (sortiert nach Datum absteigend). "
+                "Für 'die letzten N Rechnungen' einfach limit=N setzen. "
+                "Optional kann nach Kundenname, Rechnungsnummer oder Status gefiltert werden."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Anzahl zurückzugebender Rechnungen (Standard 20).",
+                        "minimum": 1,
+                        "maximum": 150,
+                    },
+                    "pageNumber": {
+                        "type": "integer",
+                        "description": "Seitenzahl ab 1 (wird auf page[number] gemappt).",
+                        "minimum": 1,
+                    },
+                    "sortBy": {
+                        "type": "string",
+                        "enum": [
+                            "date", "id", "invoice", "customerName",
+                            "customerNumber", "amountNet", "paymentStatus", "status",
+                        ],
+                        "description": "Sortierfeld (Standard: date).",
+                    },
+                    "sortDir": {
+                        "type": "string",
+                        "enum": ["asc", "desc"],
+                        "description": "Sortierrichtung (Standard: desc = neueste zuerst).",
+                    },
+                    "customerNameContains": {
+                        "type": "string",
+                        "description": "Optional: Filter nach Kundenname (Teilstring).",
+                    },
+                    "invoiceNumber": {
+                        "type": "string",
+                        "description": "Optional: Filter nach Rechnungsnummer.",
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Optional: Filter nach Status (z.B. 'released', 'paid').",
+                    },
+                },
+            },
+        ),
+        types.Tool(
+            name="xentral_get_invoice",
+            description="Liest eine einzelne Rechnung aus Xentral per Rechnungs-ID (inkl. Positionen).",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "invoiceId": {
+                        "type": "string",
+                        "description": "Rechnungs-ID aus Xentral (nicht die Rechnungsnummer).",
+                    }
+                },
+                "required": ["invoiceId"],
+            },
+        ),
+        types.Tool(
             name="xentral_raw_request",
             description=(
-                "Low-level Xentral-API-Request. "
-                "Nur verwenden, wenn explizit vom Nutzer gewünscht. "
-                "Für normale Aufgaben besser die spezialisieren Tools nutzen."
+                "Low-level Xentral-API-Request für Endpunkte ohne eigenes Tool. "
+                "Pfad relativ zur Base-URL (…/api/v1), z.B. 'invoices/123/documents'. "
+                "Bei HTTP 406 werden alternative Accept-Header automatisch probiert; "
+                "mit 'accept' kann ein Media-Type explizit gesetzt werden. "
+                "Für normale Aufgaben besser die spezialisierten Tools nutzen."
             ),
             inputSchema={
                 "type": "object",
@@ -235,6 +337,13 @@ async def list_tools() -> list[types.Tool]:
                     "body": {
                         "type": "string",
                         "description": "Optionaler JSON-Body als String.",
+                    },
+                    "accept": {
+                        "type": "string",
+                        "description": (
+                            "Optionaler Accept-Header, z.B. "
+                            "'application/vnd.xentral.default.v1+json'."
+                        ),
                     },
                 },
                 "required": ["method", "path"],
@@ -393,6 +502,80 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
             return [types.TextContent(type="text", text=text)]
 
         # ---------------------------------------------------------------
+        #   Rechnungen: Liste
+        # ---------------------------------------------------------------
+        if name == "xentral_list_invoices":
+            limit = int(arguments.get("limit", 20))
+            page_number = int(arguments.get("pageNumber", 1))
+            sort_by = arguments.get("sortBy", "date")
+            sort_dir = arguments.get("sortDir", "desc")
+            customer_name = arguments.get("customerNameContains")
+            invoice_number = arguments.get("invoiceNumber")
+            status = arguments.get("status")
+
+            if limit < 1 or limit > 150:
+                return [types.TextContent(type="text", text="limit muss zwischen 1 und 150 liegen")]
+            if page_number < 1:
+                return [types.TextContent(type="text", text="pageNumber muss >= 1 sein")]
+
+            params: Dict[str, Any] = {
+                "page[number]": str(page_number),
+                # Xentral akzeptiert nur page[size] zwischen 10 und 150;
+                # bei kleinerem limit wird die Antwort unten gekürzt.
+                "page[size]": str(_clamp_page_size(limit)),
+                "order[0][field]": sort_by,
+                "order[0][dir]": sort_dir,
+            }
+
+            filters = []
+            if customer_name:
+                filters.append(("customerName", "contains", customer_name))
+            if invoice_number:
+                filters.append(("invoice", "contains", invoice_number))
+            if status:
+                filters.append(("status", "equals", status))
+            for i, (key, op, value) in enumerate(filters):
+                params[f"filter[{i}][key]"] = key
+                params[f"filter[{i}][op]"] = op
+                params[f"filter[{i}][value]"] = value
+
+            status_code, data = await _make_request(client, "GET", "invoices", params=params)
+
+            if status_code >= 400:
+                return [
+                    types.TextContent(
+                        type="text",
+                        text=f"HTTP-Fehler {status_code} von Xentral bei xentral_list_invoices: {data}",
+                    )
+                ]
+
+            data = _truncate_data(data, limit)
+            text = json.dumps(data, indent=2, ensure_ascii=False)
+            return [types.TextContent(type="text", text=text)]
+
+        # ---------------------------------------------------------------
+        #   Rechnungen: Einzelne Rechnung
+        # ---------------------------------------------------------------
+        if name == "xentral_get_invoice":
+            invoice_id = arguments["invoiceId"]
+
+            if not invoice_id or not str(invoice_id).strip():
+                return [types.TextContent(type="text", text="invoiceId darf nicht leer sein")]
+
+            status_code, data = await _make_request(client, "GET", f"invoices/{invoice_id}")
+
+            if status_code >= 400:
+                return [
+                    types.TextContent(
+                        type="text",
+                        text=f"HTTP-Fehler {status_code} von Xentral bei xentral_get_invoice: {data}",
+                    )
+                ]
+
+            text = json.dumps(data, indent=2, ensure_ascii=False)
+            return [types.TextContent(type="text", text=text)]
+
+        # ---------------------------------------------------------------
         #   Low-level: xentral_raw_request
         # ---------------------------------------------------------------
         if name == "xentral_raw_request":
@@ -400,6 +583,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
             path = str(arguments["path"]).lstrip("/")
             params = arguments.get("params") or {}
             body_str = arguments.get("body")
+            accept = arguments.get("accept")
 
             if method not in ["GET", "POST", "PATCH", "DELETE"]:
                 return [types.TextContent(type="text", text=f"Ungültige HTTP-Methode: {method}")]
@@ -422,6 +606,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
                 path=path,
                 params=params,
                 json_body=json_body,
+                headers={"Accept": str(accept)} if accept else None,
             )
 
             if status_code >= 400:
