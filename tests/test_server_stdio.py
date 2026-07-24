@@ -21,11 +21,69 @@ INVOICES = [
 ]
 
 
+ANALYTICS_DOCS = {
+    "data": [
+        {
+            "label": "invoice_items",
+            "shortDescription": "Items of invoices.",
+            "columns": [{"name": "invoice_id"}, {"name": "net_revenue_item_total"}],
+        },
+        {
+            "label": "products",
+            "shortDescription": "All products.",
+            "columns": [{"name": "product_id"}, {"name": "product_number"}],
+        },
+    ]
+}
+
+analytics_doc_requests = {"count": 0}
+
+
 class MockXentralHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        length = int(self.headers.get("Content-Length") or 0)
+        body = json.loads(self.rfile.read(length).decode()) if length else {}
+
+        if parsed.path.endswith("/analytics/query"):
+            payload = {
+                "data": {"header": ["n"], "rows": [["42"]]},
+                "meta": {"query": body.get("query")},
+            }
+        else:
+            payload = {"echo": {"path": parsed.path, "body": body}}
+
+        out = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         accept = self.headers.get("Accept", "")
+
+        if parsed.path.endswith("/analytics/credit"):
+            payload = {"data": [{"totalCredits": 250, "usedCredits": 24}]}
+            out = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+
+        if parsed.path.endswith("/analytics/documentation"):
+            analytics_doc_requests["count"] += 1
+            out = json.dumps(ANALYTICS_DOCS).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
 
         if parsed.path.rstrip("/").endswith("/invoices"):
             # Echte Xentral-Instanzen beantworten 'application/json'
@@ -113,5 +171,33 @@ print("PASS: xentral_raw_request mit explizitem Accept-Header")
 text = call("xentral_raw_request", {"method": "GET", "path": "invoices"})
 assert "RE-2026-003" in text
 print("PASS: xentral_raw_request mit automatischem 406-Fallback")
+
+# --- analytics_query: führt SQL aus und hängt Credit-Stand an ---
+text = call("xentral_analytics_query", {"sql": "SELECT COUNT(*) AS n FROM invoice_items"})
+assert '"rows"' in text and "42" in text
+assert "24/250" in text, f"Credit-Stand fehlt in Antwort: {text[-200:]}"
+print("PASS: xentral_analytics_query mit Credit-Stand")
+
+# --- analytics_query: leeres SQL wird abgelehnt ---
+text = call("xentral_analytics_query", {"sql": "  "})
+assert "darf nicht leer sein" in text
+print("PASS: xentral_analytics_query Validierung")
+
+# --- analytics_tables: Liste ohne Suchbegriff ---
+text = call("xentral_analytics_tables", {})
+assert "invoice_items" in text and "products" in text
+assert "2 Analytics-Tabellen" in text
+print("PASS: xentral_analytics_tables Liste")
+
+# --- analytics_tables: Suche matcht Tabelle + Spalten, Doku wird gecacht ---
+text = call("xentral_analytics_tables", {"search": "revenue"})
+assert "invoice_items" in text and "net_revenue_item_total" in text
+assert "products" not in text.replace("net_revenue_item_total", "")
+text = call("xentral_analytics_tables", {"search": "gibtsnicht"})
+assert "Keine Analytics-Tabelle" in text
+assert analytics_doc_requests["count"] == 1, (
+    f"Doku muss gecacht werden, wurde aber {analytics_doc_requests['count']}x geladen"
+)
+print("PASS: xentral_analytics_tables Suche + Cache")
 
 print("ALL TESTS PASSED")
