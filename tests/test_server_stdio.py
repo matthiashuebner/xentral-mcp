@@ -85,6 +85,36 @@ class MockXentralHandler(BaseHTTPRequestHandler):
             self.wfile.write(out)
             return
 
+        if parsed.path.rstrip("/").endswith("/customers"):
+            # Wie die echte Instanz: Cursor-Pagination, page[...] wird abgelehnt.
+            if any(k.startswith("page[") for k in query):
+                out = json.dumps({
+                    "type": "https://api.xentral.biz/problems/generic-validation",
+                    "title": "Generic request validation failed.",
+                    "messages": [""],
+                }).encode()
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+                return
+            payload = {
+                "data": [{"id": str(i), "general": {"name": f"Kunde {i}"}} for i in range(1, 11)],
+                "extra": {
+                    "totalCount": 2865,
+                    "cursor": {"nextCursor": "MTY3", "size": 10},
+                },
+                "echo": {"query": query},
+            }
+            out = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+
         if parsed.path.rstrip("/").endswith("/invoices"):
             # Echte Xentral-Instanzen beantworten 'application/json'
             # hier mit 406 – nur der Vendor-Media-Type funktioniert.
@@ -95,7 +125,10 @@ class MockXentralHandler(BaseHTTPRequestHandler):
                 return
             payload = {"data": INVOICES, "echo": {"query": query, "accept": accept}}
         else:
-            payload = {"data": [{"id": 1}], "echo": {"path": parsed.path}}
+            payload = {
+                "data": [{"id": i} for i in range(1, 11)],
+                "echo": {"path": parsed.path, "query": query},
+            }
 
         out = json.dumps(payload).encode()
         self.send_response(200)
@@ -199,5 +232,36 @@ assert analytics_doc_requests["count"] == 1, (
     f"Doku muss gecacht werden, wurde aber {analytics_doc_requests['count']}x geladen"
 )
 print("PASS: xentral_analytics_tables Suche + Cache")
+
+# --- list_customers: Cursor-Pagination statt page[], limit-Kürzung ---
+text = call("xentral_list_customers", {"limit": 3, "nameContains": "Braun"})
+data = json.loads(text)
+assert len(data["data"]) == 3, f"limit=3 nicht angewendet: {len(data['data'])}"
+assert data["extra"]["totalCount"] == 2865
+query = data["echo"]["query"]
+assert query["cursor[size]"] == ["10"], "cursor[size] muss auf min. 10 geklemmt werden"
+assert "page[number]" not in query and "page[size]" not in query
+assert query["filter[0][key]"] == ["name"]
+assert query["filter[0][op]"] == ["contains"]
+assert query["filter[0][value]"] == ["Braun"]
+print("PASS: xentral_list_customers Cursor-Pagination + Filter + limit")
+
+# --- list_customers: cursor wird durchgereicht ---
+text = call("xentral_list_customers", {"limit": 10, "cursor": "MTY3"})
+query = json.loads(text)["echo"]["query"]
+assert query["cursor[nextCursor]"] == ["MTY3"]
+print("PASS: xentral_list_customers Folgeseite per cursor")
+
+# --- list_products: indexierte Filter, page[size]-Klemmung, Kürzung ---
+text = call("xentral_list_products", {"pageSize": 5, "nameContains": "Lexmark", "skuEquals": "125512"})
+data = json.loads(text)
+assert len(data["data"]) <= 5
+query = data["echo"]["query"]
+assert query["page[size]"] == ["10"], "page[size] muss auf min. 10 geklemmt werden"
+assert query["filter[0][key]"] == ["name"]
+assert query["filter[0][op]"] == ["contains"]
+assert query["filter[1][key]"] == ["number"]
+assert query["filter[1][op]"] == ["equals"]
+print("PASS: xentral_list_products Filter-Format + Klemmung")
 
 print("ALL TESTS PASSED")
