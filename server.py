@@ -71,27 +71,32 @@ async def _make_request(
     path: str,
     params: Optional[Dict[str, Any]] = None,
     json_body: Optional[Dict[str, Any]] = None,
-    retries: int = 0,
     headers: Optional[Dict[str, str]] = None,
 ) -> tuple[int, Any]:
     """
     Macht einen HTTP-Request zu Xentral mit Retry-Logik.
-    Gibt (status_code, data) zurück.
+    Gibt (status_code, data) zurück; wirft nie eine Exception, sondern
+    liefert nach erschöpften Retries (599, Fehlermeldung).
     """
-    if retries > XENTRAL_MAX_RETRIES:
-        raise RuntimeError(
-            f"Max retries ({XENTRAL_MAX_RETRIES}) exceeded for {method} {path}"
-        )
+    last_error: Optional[Exception] = None
 
-    try:
-        logger.debug(f"{method} {path} (attempt {retries + 1})")
-        resp = await client.request(
-            method=method,
-            url=path,
-            params=params,
-            json=json_body,
-            headers=headers,
-        )
+    for attempt in range(XENTRAL_MAX_RETRIES + 1):
+        if attempt > 0:
+            await asyncio.sleep(min(2 ** (attempt - 1), 10))  # Exponential backoff, gedeckelt
+
+        try:
+            logger.debug(f"{method} {path} (attempt {attempt + 1})")
+            resp = await client.request(
+                method=method,
+                url=path,
+                params=params,
+                json=json_body,
+                headers=headers,
+            )
+        except httpx.HTTPError as exc:
+            last_error = exc
+            logger.warning(f"Request error for {method} {path}: {exc}, retrying...")
+            continue
 
         # Versuchen, JSON zu lesen – sonst Text
         try:
@@ -101,13 +106,13 @@ async def _make_request(
 
         if resp.status_code == 406 and headers is None:
             for accept in ACCEPT_FALLBACKS:
-                status_code, data = await _make_request(
+                status_code, fallback_data = await _make_request(
                     client, method, path, params, json_body,
-                    retries=retries, headers={"Accept": accept},
+                    headers={"Accept": accept},
                 )
                 if status_code != 406:
                     logger.info(f"Accept-Fallback '{accept}' erfolgreich für {method} {path}")
-                    return (status_code, data)
+                    return (status_code, fallback_data)
             return (406, data)
 
         if resp.is_error:
@@ -119,14 +124,20 @@ async def _make_request(
 
         return (resp.status_code, data)
 
-    except httpx.TimeoutException:
-        logger.warning(f"Timeout for {method} {path}, retrying...")
-        await asyncio.sleep(2 ** retries)  # Exponential backoff
-        return await _make_request(client, method, path, params, json_body, retries + 1, headers)
-    except httpx.RequestError as exc:
-        logger.warning(f"Request error for {method} {path}: {exc}, retrying...")
-        await asyncio.sleep(2 ** retries)
-        return await _make_request(client, method, path, params, json_body, retries + 1, headers)
+    logger.error(f"Max retries exceeded for {method} {path}: {last_error}")
+    return (
+        599,
+        f"Xentral nicht erreichbar nach {XENTRAL_MAX_RETRIES + 1} Versuchen: {last_error}",
+    )
+
+
+def _parse_int(arguments: Dict[str, Any], key: str, default: int) -> tuple[int, Optional[str]]:
+    """Liest ein Integer-Argument tolerant. Gibt (Wert, Fehlermeldung) zurück."""
+    value = arguments.get(key, default)
+    try:
+        return (int(value), None)
+    except (TypeError, ValueError):
+        return (0, f"{key} muss eine Zahl sein, war aber: {value!r}")
 
 
 def _clamp_page_size(requested: int) -> int:
@@ -473,10 +484,29 @@ async def list_tools() -> list[types.Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextContent]:
-    """Wird vom MCP-Client aufgerufen, wenn Claude ein Tool nutzt."""
+    """Wird vom MCP-Client aufgerufen, wenn Claude ein Tool nutzt.
+
+    Fängt jede Exception ab, damit der Server unter keinen Umständen mit
+    einem Protokollfehler antwortet oder abstürzt.
+    """
+    try:
+        return await _call_tool_impl(name, arguments)
+    except Exception as exc:  # pragma: no cover - letzte Verteidigungslinie
+        logger.exception(f"Unhandled error in tool {name}")
+        return [
+            types.TextContent(
+                type="text",
+                text=f"Interner Fehler im Tool {name}: {type(exc).__name__}: {exc}",
+            )
+        ]
+
+
+async def _call_tool_impl(name: str, arguments: Dict[str, Any]) -> list[types.TextContent]:
+    if not isinstance(arguments, dict):
+        arguments = {}
+
     # Log argument keys only; values may contain secrets/PII.
-    arg_keys = sorted(arguments.keys()) if isinstance(arguments, dict) else []
-    logger.info(f"Tool called: {name} (argument keys: {arg_keys})")
+    logger.info(f"Tool called: {name} (argument keys: {sorted(arguments.keys())})")
 
     async with httpx.AsyncClient(
         base_url=XENTRAL_BASE_URL,
@@ -488,8 +518,12 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         #   Produkte: Liste
         # ---------------------------------------------------------------
         if name == "xentral_list_products":
-            page_number = int(arguments.get("pageNumber", 1))
-            page_size = int(arguments.get("pageSize", 20))
+            page_number, err = _parse_int(arguments, "pageNumber", 1)
+            if err:
+                return [types.TextContent(type="text", text=err)]
+            page_size, err = _parse_int(arguments, "pageSize", 20)
+            if err:
+                return [types.TextContent(type="text", text=err)]
             name_contains = arguments.get("nameContains")
             sku_equals = arguments.get("skuEquals")
 
@@ -534,7 +568,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         #   Produkte: Einzelnes Produkt
         # ---------------------------------------------------------------
         if name == "xentral_get_product":
-            product_id = arguments["productId"]
+            product_id = arguments.get("productId")
             
             if not product_id or not str(product_id).strip():
                 return [types.TextContent(type="text", text="productId darf nicht leer sein")]
@@ -556,7 +590,9 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         #   Kunden: Liste
         # ---------------------------------------------------------------
         if name == "xentral_list_customers":
-            limit = int(arguments.get("limit", 20))
+            limit, err = _parse_int(arguments, "limit", 20)
+            if err:
+                return [types.TextContent(type="text", text=err)]
             cursor = arguments.get("cursor")
             name_contains = arguments.get("nameContains")
             email_contains = arguments.get("emailContains")
@@ -602,7 +638,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         #   Kunden: Einzelner Kunde
         # ---------------------------------------------------------------
         if name == "xentral_get_customer":
-            customer_id = arguments["customerId"]
+            customer_id = arguments.get("customerId")
             
             if not customer_id or not str(customer_id).strip():
                 return [types.TextContent(type="text", text="customerId darf nicht leer sein")]
@@ -624,8 +660,12 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         #   Rechnungen: Liste
         # ---------------------------------------------------------------
         if name == "xentral_list_invoices":
-            limit = int(arguments.get("limit", 20))
-            page_number = int(arguments.get("pageNumber", 1))
+            limit, err = _parse_int(arguments, "limit", 20)
+            if err:
+                return [types.TextContent(type="text", text=err)]
+            page_number, err = _parse_int(arguments, "pageNumber", 1)
+            if err:
+                return [types.TextContent(type="text", text=err)]
             sort_by = arguments.get("sortBy", "date")
             sort_dir = arguments.get("sortDir", "desc")
             customer_name = arguments.get("customerNameContains")
@@ -676,7 +716,7 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         #   Rechnungen: Einzelne Rechnung
         # ---------------------------------------------------------------
         if name == "xentral_get_invoice":
-            invoice_id = arguments["invoiceId"]
+            invoice_id = arguments.get("invoiceId")
 
             if not invoice_id or not str(invoice_id).strip():
                 return [types.TextContent(type="text", text="invoiceId darf nicht leer sein")]
@@ -749,8 +789,10 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextCont
         #   Low-level: xentral_raw_request
         # ---------------------------------------------------------------
         if name == "xentral_raw_request":
-            method = str(arguments["method"]).upper()
-            path = str(arguments["path"]).lstrip("/")
+            method = str(arguments.get("method") or "").upper()
+            path = str(arguments.get("path") or "").lstrip("/")
+            if not method or not path:
+                return [types.TextContent(type="text", text="method und path sind erforderlich")]
             params = arguments.get("params") or {}
             body_str = arguments.get("body")
             accept = arguments.get("accept")
