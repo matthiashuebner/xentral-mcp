@@ -264,4 +264,37 @@ assert query["filter[1][key]"] == ["number"]
 assert query["filter[1][op]"] == ["equals"]
 print("PASS: xentral_list_products Filter-Format + Klemmung")
 
+# --- Robustheit: ungültige Zahlen-Argumente geben klare Meldung statt Exception ---
+text = call("xentral_list_invoices", {"limit": "abc"})
+assert "muss eine Zahl sein" in text, f"unerwartete Antwort: {text[:120]}"
+print("PASS: ungültiges Zahlenargument wird sauber abgewiesen")
+
+# --- Robustheit: fehlende Pflichtfelder geben klare Meldung statt KeyError ---
+text = call("xentral_get_product", {})
+assert "darf nicht leer sein" in text
+text = call("xentral_raw_request", {"method": "GET"})
+assert "erforderlich" in text
+print("PASS: fehlende Pflichtfelder werden sauber abgewiesen")
+
+# --- Robustheit: unerwartete Exceptions werden abgefangen ---
+original = server._format_analytics_tables
+server._format_analytics_tables = lambda *a: (_ for _ in ()).throw(RuntimeError("Boom"))
+try:
+    text = call("xentral_analytics_tables", {})
+finally:
+    server._format_analytics_tables = original
+assert "Interner Fehler im Tool xentral_analytics_tables" in text and "Boom" in text
+print("PASS: unerwartete Exception wird als saubere Fehlermeldung gemeldet")
+
+# --- Robustheit: nicht erreichbares Xentral gibt 599-Meldung statt Exception ---
+original_url, original_retries = server.XENTRAL_BASE_URL, server.XENTRAL_MAX_RETRIES
+server.XENTRAL_BASE_URL = "http://127.0.0.1:9/"  # Port 9 (discard): nicht erreichbar
+server.XENTRAL_MAX_RETRIES = 0
+try:
+    text = call("xentral_get_product", {"productId": "1"})
+finally:
+    server.XENTRAL_BASE_URL, server.XENTRAL_MAX_RETRIES = original_url, original_retries
+assert "599" in text and "nicht erreichbar" in text, f"unerwartete Antwort: {text[:200]}"
+print("PASS: Verbindungsfehler wird nach Retries als Meldung zurückgegeben")
+
 print("ALL TESTS PASSED")
