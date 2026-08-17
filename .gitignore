@@ -11,5 +11,10 @@ venv/
 mcp_server.log
 downloads/
 
+# OAuth store: holds the token signing key plus client and token hashes
+oauth-store.sqlite3
+oauth-store.sqlite3-wal
+oauth-store.sqlite3-shm
+
 # macOS
 .DS_Store

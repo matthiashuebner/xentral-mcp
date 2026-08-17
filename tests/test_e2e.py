@@ -10,9 +10,27 @@ os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # --- Mock Xentral API server: echoes method, path, query, body ---
 class EchoHandler(BaseHTTPRequestHandler):
+    # Paths listed here answer 406 unless the request asks for the vendor media
+    # type — the behaviour real Xentral shows on /invoices. Used to exercise the
+    # Accept fallback in the executor.
+    picky_paths = ()
+    required_accept = "application/vnd.xentral.minimal+json"
+    accept_attempts = []
+
     def _handle(self):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length).decode() if length else ""
+
+        if any(self.path.startswith(p) for p in EchoHandler.picky_paths):
+            accept = self.headers.get("Accept")
+            EchoHandler.accept_attempts.append(accept)
+            if accept != EchoHandler.required_accept:
+                self.send_response(406)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+
         payload = {
             "echo": {
                 "method": self.command,
@@ -115,6 +133,43 @@ resp = json.loads(mcp_protocol.handle_request(json.dumps({
 text = resp["result"]["content"][0]["text"]
 assert "city" in text and "Berlin" in text, f"JSON-string filter failed: {text[:300]}"
 print("PASS: filter passed as JSON string is parsed and serialized")
+
+# --- tools/call: endpoint that 406s on a generic Accept ---
+# Real Xentral refuses /invoices unless a vendor media type is requested. The
+# executor must recover from that on its own; before the fallback existed this
+# knowledge lived only in the (now removed) stdio server.
+EchoHandler.picky_paths = ("/api/v1/invoices",)
+EchoHandler.accept_attempts = []
+resp = json.loads(mcp_protocol.handle_request(json.dumps({
+    "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+    "params": {"name": "invoice_list", "arguments": {}}
+})))
+text = resp["result"]["content"][0]["text"]
+assert '"Test"' in text, f"406 fallback did not recover: {text[:300]}"
+assert EchoHandler.required_accept in EchoHandler.accept_attempts, (
+    f"vendor Accept never tried: {EchoHandler.accept_attempts}"
+)
+assert len(EchoHandler.accept_attempts) >= 2, (
+    f"expected a retry after the 406: {EchoHandler.accept_attempts}"
+)
+print(
+    f"PASS: 406 recovered via Accept fallback after "
+    f"{len(EchoHandler.accept_attempts)} attempt(s)"
+)
+
+# --- tools/call: endpoint that 406s on every Accept -> real error, not silence ---
+EchoHandler.required_accept = "application/vnd.xentral.nonexistent+json"
+EchoHandler.accept_attempts = []
+resp = json.loads(mcp_protocol.handle_request(json.dumps({
+    "jsonrpc": "2.0", "id": 8, "method": "tools/call",
+    "params": {"name": "invoice_list", "arguments": {}}
+})))
+text = resp["result"]["content"][0]["text"]
+assert "406" in text, f"exhausted fallback should surface the 406: {text[:300]}"
+assert len(EchoHandler.accept_attempts) == 1 + 4, (
+    f"expected the original plus every fallback: {EchoHandler.accept_attempts}"
+)
+print("PASS: exhausted Accept fallback surfaces the 406 instead of an empty result")
 
 server.shutdown()
 print("\nALL TESTS PASSED")

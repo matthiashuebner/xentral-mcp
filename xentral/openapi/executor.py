@@ -27,6 +27,21 @@ MAX_RESPONSE_CHARS = 60_000
 # Where binary responses (PDF, ZIP, images, ...) are stored
 DOWNLOADS_DIR = Path("downloads")
 
+# Some Xentral endpoints reject a generic Accept with HTTP 406 and insist on a
+# vendor media type. On a 406 these are tried in order; the first non-406 answer
+# wins. Empirically (instance 643920e461b65) /invoices accepts only the
+# `minimal` variant and 406s on the `default` ones — hence the order.
+#
+# Note the first attempt deliberately sends no explicit Accept: httpx then asks
+# for */*, which most endpoints answer directly. Pinning the first attempt to
+# application/json would provoke the very 406 this list exists to recover from.
+ACCEPT_FALLBACKS = (
+    "application/vnd.xentral.minimal+json",
+    "application/vnd.xentral.default.v1+json",
+    "application/vnd.xentral.default.v1-beta+json",
+    "*/*",
+)
+
 
 def flatten_query_value(prefix: str, value: Any, out: Dict[str, str]) -> None:
     """
@@ -99,6 +114,10 @@ class OpenAPIToolExecutor(XentralAPIBase):
                     params=params or None,
                     json=json_body,
                 )
+                if response.status_code == 406:
+                    response = self._retry_with_vendor_accept(
+                        client, operation, url, params, json_body, response
+                    )
 
             return self._format_response(operation, response)
 
@@ -111,6 +130,43 @@ class OpenAPIToolExecutor(XentralAPIBase):
         except Exception as error:  # pragma: no cover - defensive
             logger.exception("Unexpected error in %s", operation.get("name"))
             return self.format_error_response(error)
+
+    def _retry_with_vendor_accept(
+        self,
+        client: httpx.Client,
+        operation: Dict[str, Any],
+        url: str,
+        params: Optional[Dict[str, str]],
+        json_body: Optional[Dict[str, Any]],
+        original: httpx.Response,
+    ) -> httpx.Response:
+        """
+        Re-send a request that was refused with 406, cycling through the vendor
+        media types in ACCEPT_FALLBACKS.
+
+        Returns the first answer that is not a 406, or the original 406 when
+        every media type is refused — so the caller still surfaces a real error
+        instead of a silent empty result.
+        """
+        for accept in ACCEPT_FALLBACKS:
+            logger.info(
+                "%s %s returned 406; retrying with Accept: %s",
+                operation["method"], url, accept,
+            )
+            retried = client.request(
+                method=operation["method"],
+                url=url,
+                params=params or None,
+                json=json_body,
+                headers={"Accept": accept},
+            )
+            if retried.status_code != 406:
+                return retried
+
+        logger.warning(
+            "%s %s returned 406 for every Accept variant tried", operation["method"], url
+        )
+        return original
 
     # ------------------------------------------------------------------
     # Request building
