@@ -19,6 +19,9 @@ exposes the **complete Xentral API** — every endpoint of the official
 - **Xentral-native filtering**: deepObject query serialization
   (`filter[0][key]=name&filter[0][op]=equals&filter[0][value]=Miller`),
   pagination (`page[number]`, `page[size]`) and sorting (`order[0][field]`)
+- **Vendor media-type recovery**: endpoints that answer a generic `Accept` with
+  HTTP 406 (`/invoices` among them) are retried with Xentral's vendor media
+  types until one is accepted
 - **Binary downloads**: PDF/CSV/ZIP responses (e.g. invoice PDFs) are saved
   to `downloads/` instead of flooding the context window
 - **Response truncation**: Large list responses are trimmed with a hint to
@@ -191,10 +194,9 @@ resource.
 The suites are standalone scripts and need no external services:
 
 ```bash
-python tests/test_security.py      # auth gate, SSRF guard, log redaction
-python tests/test_oauth.py         # OAuth flow, token binding, HTTP transport
-python tests/test_e2e.py           # tool execution against a local stub API
-python tests/test_server_stdio.py  # the legacy stdio server (server.py)
+python tests/test_security.py  # auth gate, SSRF guard, log redaction
+python tests/test_oauth.py     # OAuth flow, token binding, HTTP transport
+python tests/test_e2e.py       # tool execution and Accept fallback against a stub API
 ```
 
 All endpoints except `/health` require the bearer token when `MCP_AUTH_TOKEN`
@@ -232,8 +234,6 @@ curl -X POST http://localhost:8888/mcp \
   - `routes.py` - Discovery, registration, consent, token and revocation endpoints
   - `tokens.py` - HMAC-signed access tokens and PKCE helpers
   - `store.py` - SQLite store for clients, codes and refresh tokens
-- `server.py` - Legacy stdio server (own tool set; configured via
-  `XENTRAL_BASE_URL` / `XENTRAL_PAT`, not the variables above)
 - `mcp_client.py` - CLI testing client
 - `mcp-tools-list.md` - Generated overview of all tools
 - `.env.example` - Configuration template
