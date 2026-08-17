@@ -208,17 +208,15 @@ def _truncate_data(data: Any, limit: int) -> Any:
 
 
 # ---------------------------------------------------------------------------
-#   MCP Server
-# ---------------------------------------------------------------------------
-
-app = Server("xentral-mcp")
-
-
-# ---------------------------------------------------------------------------
 #   Tools deklarieren (Claude lernt hier, welche Felder es gibt)
 # ---------------------------------------------------------------------------
+#
+#   Die Handler sind bewusst freie Funktionen mit einfachen Signaturen
+#   (list[types.Tool] bzw. list[types.TextContent]). Die Anbindung an das SDK
+#   passiert unten in einer schmalen Adapterschicht — so bleibt die Tool-Logik
+#   von SDK-Umbauten unberührt und direkt testbar.
+# ---------------------------------------------------------------------------
 
-@app.list_tools()
 async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
@@ -482,7 +480,6 @@ async def list_tools() -> list[types.Tool]:
 #   Tool-Aufrufe behandeln
 # ---------------------------------------------------------------------------
 
-@app.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> list[types.TextContent]:
     """Wird vom MCP-Client aufgerufen, wenn Claude ein Tool nutzt.
 
@@ -836,6 +833,36 @@ async def _call_tool_impl(name: str, arguments: Dict[str, Any]) -> list[types.Te
             text=f"Unbekanntes Tool: {name}",
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+#   MCP-Server / SDK-Anbindung
+# ---------------------------------------------------------------------------
+#
+#   Ab MCP-SDK 2.0 gibt es die Decorator-Registrierung (@app.list_tools() /
+#   @app.call_tool()) nicht mehr; Handler werden dem Server-Konstruktor
+#   übergeben und liefern vollständige Result-Objekte statt nackter Listen.
+#   Die beiden Adapter unten übersetzen genau das — die Tool-Funktionen oben
+#   behalten ihre einfachen Signaturen.
+# ---------------------------------------------------------------------------
+
+async def _on_list_tools(_ctx: Any, _params: Any) -> types.ListToolsResult:
+    return types.ListToolsResult(tools=await list_tools())
+
+
+async def _on_call_tool(_ctx: Any, params: Any) -> types.CallToolResult:
+    # call_tool() fängt selbst jede Exception ab und liefert einen Fehlertext,
+    # daher ist is_error hier nie gesetzt: der Client soll den Text sehen und
+    # nicht einen Protokollfehler.
+    content = await call_tool(params.name, params.arguments or {})
+    return types.CallToolResult(content=list(content))
+
+
+app = Server(
+    "xentral-mcp",
+    on_list_tools=_on_list_tools,
+    on_call_tool=_on_call_tool,
+)
 
 
 # ---------------------------------------------------------------------------

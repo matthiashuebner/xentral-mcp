@@ -12,8 +12,11 @@ python-dotenv>=1.0
 # HTTP client
 httpx>=0.27
 
-# MCP SDK (used by the legacy stdio server.py)
-mcp>=0.9
+# MCP SDK (used by the legacy stdio server.py).
+# Pinned to the 2.x line: 2.0 replaced the decorator registration
+# (@app.list_tools()) with constructor callbacks, so an unbounded range breaks
+# server.py at import time on the next major release.
+mcp>=2.0,<3
 
 # Table formatting
 tabulate>=0.9

@@ -297,4 +297,56 @@ finally:
 assert "599" in text and "nicht erreichbar" in text, f"unerwartete Antwort: {text[:200]}"
 print("PASS: Verbindungsfehler wird nach Retries als Meldung zurückgegeben")
 
+# --- Echter stdio-Handshake gegen einen Subprozess ---
+#
+# Die Checks oben rufen list_tools()/call_tool() direkt auf und würden auch
+# grün bleiben, wenn die Anbindung an das SDK gar nicht mehr passt — genau so
+# ist die Decorator-Registrierung beim Sprung auf SDK 2.0 unbemerkt gebrochen.
+# Dieser Check spricht daher als echter MCP-Client über stdin/stdout mit einem
+# frisch gestarteten server.py.
+
+async def _stdio_handshake():
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    async def _run():
+        return await _drive_session(StdioServerParameters, stdio_client, ClientSession)
+
+    # Hard timeout so a hung handshake fails the suite instead of blocking CI.
+    return await asyncio.wait_for(_run(), timeout=60)
+
+
+async def _drive_session(StdioServerParameters, stdio_client, ClientSession):
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["server.py"],
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env={
+            **os.environ,
+            "XENTRAL_BASE_URL": os.environ["XENTRAL_BASE_URL"],
+            "XENTRAL_PAT": os.environ["XENTRAL_PAT"],
+        },
+    )
+    async with stdio_client(params) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            init = await session.initialize()
+            listed = await session.list_tools()
+            called = await session.call_tool("xentral_get_product", {"productId": "1"})
+            return init, listed, called
+
+
+init_result, listed_result, call_result = asyncio.run(_stdio_handshake())
+assert init_result.server_info.name == "xentral-mcp", init_result.server_info
+print(f"PASS: stdio-Handshake erfolgreich (Protokoll {init_result.protocol_version})")
+
+handshake_names = {t.name for t in listed_result.tools}
+assert handshake_names == names, (
+    f"tools/list über stdio weicht ab: {handshake_names ^ names}"
+)
+print(f"PASS: tools/list über stdio liefert dieselben {len(handshake_names)} Tools")
+
+assert call_result.content and call_result.content[0].text, call_result
+assert not call_result.is_error, call_result
+print("PASS: tools/call über stdio liefert Inhalt")
+
 print("ALL TESTS PASSED")

@@ -232,6 +232,8 @@ curl -X POST http://localhost:8888/mcp \
   - `routes.py` - Discovery, registration, consent, token and revocation endpoints
   - `tokens.py` - HMAC-signed access tokens and PKCE helpers
   - `store.py` - SQLite store for clients, codes and refresh tokens
+- `server.py` - Legacy stdio server (own tool set; configured via
+  `XENTRAL_BASE_URL` / `XENTRAL_PAT`, not the variables above)
 - `mcp_client.py` - CLI testing client
 - `mcp-tools-list.md` - Generated overview of all tools
 - `.env.example` - Configuration template
