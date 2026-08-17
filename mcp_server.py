@@ -27,6 +27,8 @@ from flask import Flask, request, jsonify, Response, g
 from config import config
 from mcp_protocol import MCPProtocol, MCPTool, MCPToolParameter
 from security import check_bearer_token, redact, ApiUrlValidationError
+from mcp_oauth import OAuthStore, TokenError, verify_access_token
+from mcp_oauth.routes import create_oauth_blueprint
 from xentral.openapi.loader import load_openapi_tools
 
 # Setup logging
@@ -205,6 +207,16 @@ def _infer_tool_description(tool_name: str) -> str:
 # Endpoints that do not require authentication. Everything else is gated.
 PUBLIC_PATHS = frozenset({'/health'})
 
+# OAuth discovery and flow endpoints must answer without a token — they are how
+# a client learns *how* to authenticate and then does so. They are only opened
+# when OAuth is enabled; otherwise no such route exists in the first place.
+OAUTH_PUBLIC_PREFIXES = ('/.well-known/oauth-', '/oauth/')
+
+
+def _sanitize_header_value(value: str) -> str:
+    """Strip characters that would let a value break out of a header."""
+    return value.replace('"', "'").replace('\r', ' ').replace('\n', ' ')[:200]
+
 
 def create_app():
     """Create and configure Flask application."""
@@ -215,31 +227,140 @@ def create_app():
     # If a specific browser origin must be supported, add a narrowly-scoped
     # allow-list here paired with the auth token — never a wildcard.
 
+    # The OAuth store is opened once per process. It is only touched by the
+    # authorization flow and (for the signing key) on the first token check —
+    # never per MCP request, since access tokens verify statelessly.
+    oauth_store = OAuthStore(config.oauth_db_path) if config.is_oauth_enabled() else None
+    if oauth_store is not None:
+        app.register_blueprint(create_oauth_blueprint(config, oauth_store))
+        oauth_store.purge_expired()
+        logger.info(
+            "OAuth 2.1 authorization server enabled; issuer=%s resource=%s",
+            config.oauth_issuer, config.mcp_resource_url,
+        )
+
+    def _oauth_signing_key() -> bytes:
+        return config.oauth_signing_key_bytes or oauth_store.signing_key()
+
+    def _is_public_path(path: str) -> bool:
+        if path in PUBLIC_PATHS:
+            return True
+        if config.is_oauth_enabled() and path.startswith(OAUTH_PUBLIC_PREFIXES):
+            return True
+        return False
+
+    def _verify_oauth_token(auth_header):
+        """Return (claims, failure_reason). Exactly one of the two is None."""
+        if not auth_header:
+            return None, 'missing_token'
+        parts = auth_header.split(None, 1)
+        if len(parts) != 2 or parts[0].lower() != 'bearer':
+            return None, 'missing_token'
+
+        try:
+            claims = verify_access_token(
+                parts[1].strip(),
+                _oauth_signing_key(),
+                issuer=config.oauth_issuer,
+                audiences=(config.mcp_resource_url, config.oauth_issuer),
+            )
+        except TokenError as exc:
+            return None, str(exc)
+
+        if 'mcp' not in str(claims.get('scope', '')).split():
+            return None, 'insufficient_scope'
+        return claims, None
+
+    def _auth_challenge(error: str, description: str, status: int):
+        """
+        Build the 401/403 that starts a remote client's OAuth flow.
+
+        The `resource_metadata` parameter is the load-bearing part: without it a
+        client has no way to discover the authorization server and simply
+        reports an authorization error, which is precisely the failure mode this
+        endpoint used to produce.
+        """
+        challenge = 'Bearer realm="xentral-mcp"'
+        if error:
+            challenge += f', error="{_sanitize_header_value(error)}"'
+        if description:
+            challenge += f', error_description="{_sanitize_header_value(description)}"'
+        if config.is_oauth_enabled():
+            challenge += (
+                f', resource_metadata="{config.oauth_issuer}'
+                '/.well-known/oauth-protected-resource"'
+            )
+
+        response = jsonify({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32001,
+                "message": "Unauthorized" if status == 401 else "Forbidden",
+            },
+        })
+        response.status_code = status
+        response.headers['WWW-Authenticate'] = challenge
+        return response
+
     # =============================================================================
     # AUTHENTICATION GATE
     # =============================================================================
 
     @app.before_request
     def authenticate():
-        """Require a valid bearer token on every non-public request."""
+        """
+        Authenticate every non-public request.
+
+        Two credentials are accepted, in this order:
+          1. the static `MCP_AUTH_TOKEN` — for curl, the CLI client and MCP
+             clients that can be configured with a fixed Authorization header;
+          2. an OAuth access token issued by the embedded authorization server —
+             for remote clients that only speak the discovery flow.
+        Whichever is configured may be used; a wrong static token still falls
+        through to the OAuth check before the request is rejected.
+        """
         if request.method == 'OPTIONS':
             return None
-        if request.path in PUBLIC_PATHS:
+        if _is_public_path(request.path):
             return None
-        if not config.is_auth_enabled():
-            # No token configured: only tolerated on loopback (enforced at
-            # startup by validate_exposure). Local, same-origin requests pass.
+
+        auth_header = request.headers.get('Authorization')
+
+        if config.is_auth_enabled() and check_bearer_token(auth_header, config.auth_token):
+            g.auth_principal = 'static-token'
             return None
-        if not check_bearer_token(request.headers.get('Authorization'), config.auth_token):
-            logger.warning(
-                "Rejected unauthenticated request: %s %s from %s",
-                request.method, request.path, request.remote_addr,
-            )
-            return jsonify({
-                "jsonrpc": "2.0",
-                "error": {"code": -32001, "message": "Unauthorized"},
-            }), 401
-        return None
+
+        if config.is_oauth_enabled():
+            claims, reason = _verify_oauth_token(auth_header)
+            if claims is not None:
+                g.auth_principal = f"oauth:{claims.get('client_id')}"
+                g.oauth_claims = claims
+                return None
+            if reason == 'insufficient_scope':
+                logger.warning(
+                    "Rejected request with insufficient scope: %s %s from %s",
+                    request.method, request.path, request.remote_addr,
+                )
+                return _auth_challenge(
+                    'insufficient_scope', 'the mcp scope is required', 403
+                )
+        else:
+            reason = 'invalid_token' if auth_header else 'missing_token'
+
+        if not config.is_any_auth_enabled():
+            # No authentication configured at all: tolerated on loopback only
+            # (enforced at startup by validate_exposure).
+            return None
+
+        logger.warning(
+            "Rejected unauthenticated request: %s %s from %s (%s)",
+            request.method, request.path, request.remote_addr, reason,
+        )
+        return _auth_challenge(
+            'invalid_token' if reason != 'missing_token' else '',
+            'a valid bearer token is required',
+            401,
+        )
 
     # =============================================================================
     # REQUEST LOGGING MIDDLEWARE
@@ -280,6 +401,20 @@ def create_app():
     # MCP HTTP ENDPOINTS
     # =============================================================================
     
+    def _client_wants_sse() -> bool:
+        """
+        True if the client accepts an event stream but not plain JSON.
+
+        Streamable HTTP lets the server answer a POST with either a JSON body or
+        an SSE stream. Claude sends `Accept: application/json, text/event-stream`
+        and takes either, so JSON stays the default — SSE is used only for
+        clients that ask for nothing else.
+        """
+        accept = (request.headers.get('Accept') or '').lower()
+        if 'text/event-stream' not in accept:
+            return False
+        return 'application/json' not in accept and '*/*' not in accept
+
     @app.route('/mcp', methods=['POST'])
     def handle_mcp_request():
         """Handle MCP JSON-RPC requests."""
@@ -292,16 +427,34 @@ def create_app():
                         "message": "Request must be JSON"
                     }
                 }), 400
-            
+
             # Process the MCP request
             request_data = request.get_data(as_text=True)
             response_json = mcp_protocol.handle_request(request_data)
+
+            if response_json == "":
+                # A JSON-RPC notification (e.g. notifications/initialized) has no
+                # response. Streamable HTTP requires 202 with an empty body here;
+                # the previous 200 with an empty application/json body is not
+                # valid JSON and makes strict clients abort the handshake.
+                return Response(status=202)
+
+            if _client_wants_sse():
+                return Response(
+                    f"event: message\ndata: {response_json}\n\n",
+                    mimetype='text/event-stream',
+                    headers={
+                        'Cache-Control': 'no-store',
+                        # Keep reverse proxies from buffering the stream.
+                        'X-Accel-Buffering': 'no',
+                    },
+                )
 
             return Response(
                 response_json,
                 mimetype='application/json',
             )
-        
+
         except Exception as e:
             logger.exception(f"Error handling MCP request: {e}")
             return jsonify({
@@ -312,6 +465,30 @@ def create_app():
                 }
             }), 500
     
+    @app.route('/mcp', methods=['GET', 'DELETE'])
+    def mcp_method_not_allowed():
+        """
+        Answer the other two Streamable HTTP verbs.
+
+        This server is stateless: there is no server-initiated event stream to
+        open (GET) and no session to terminate (DELETE). The spec's answer for
+        both in that case is 405, which clients treat as "no session support"
+        rather than as a failure.
+        """
+        response = jsonify({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32000,
+                "message": (
+                    f"{request.method} is not supported on /mcp; this server is "
+                    "stateless and answers JSON-RPC over POST only"
+                ),
+            },
+        })
+        response.status_code = 405
+        response.headers['Allow'] = 'POST'
+        return response
+
     # Alternative endpoints for different MCP client implementations
     @app.route('/mcp/list_tools', methods=['POST'])
     def list_tools():
@@ -476,6 +653,10 @@ def main():
     print(f"Host: {config.server_host}")
     print(f"Port: {config.server_port}")
     print(f"Auth: {'✓ Token required' if config.is_auth_enabled() else '✗ DISABLED'}")
+    if config.is_oauth_enabled():
+        print(f"OAuth: ✓ enabled (issuer {config.oauth_issuer})")
+    else:
+        print("OAuth: ✗ disabled (set MCP_OAUTH_ENABLED=true for remote MCP clients)")
     print("-" * 60)
 
     # Fatal exposure checks: never bind to the network without authentication.
@@ -513,6 +694,10 @@ def main():
     print("   - GET  /info - Server information")
     print("   - GET  /tools - List all tools")
     print("   - POST /config/credentials - Update API credentials")
+    if config.is_oauth_enabled():
+        print("   - GET  /.well-known/oauth-protected-resource - Resource metadata")
+        print("   - GET  /.well-known/oauth-authorization-server - AS metadata")
+        print("   - POST /oauth/register | GET,POST /oauth/authorize | POST /oauth/token")
     print()
     print("=" * 60)
     

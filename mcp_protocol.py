@@ -11,6 +11,13 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
+# Protocol revisions this server can speak, newest first. A client announces the
+# revision it wants in `initialize`; echoing back a revision it did not ask for
+# makes strict clients abort the handshake, so the requested one is honoured
+# when it is known and the newest supported one is offered otherwise.
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+LATEST_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0]
+
 
 @dataclass
 class MCPError:
@@ -192,12 +199,21 @@ class MCPProtocol:
         Returns:
             MCPResponse: Initialize response
         """
-        logger.info("MCP initialize request received")
-        
+        requested = (request.params or {}).get("protocolVersion")
+        negotiated = (
+            requested
+            if requested in SUPPORTED_PROTOCOL_VERSIONS
+            else LATEST_PROTOCOL_VERSION
+        )
+        logger.info(
+            "MCP initialize request received (client asked for %s, answering %s)",
+            requested or "nothing", negotiated,
+        )
+
         self.initialized = True
-        
+
         result = {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": negotiated,
             "capabilities": {
                 "tools": {
                     "listChanged": False
@@ -466,7 +482,8 @@ class MCPProtocol:
         return {
             "name": self.server_name,
             "version": self.server_version,
-            "protocol_version": "2024-11-05",
+            "protocol_version": LATEST_PROTOCOL_VERSION,
+            "supported_protocol_versions": list(SUPPORTED_PROTOCOL_VERSIONS),
             "tools_count": len(self.tools),
             "initialized": self.initialized
         }
